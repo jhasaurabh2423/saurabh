@@ -1,0 +1,369 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p "$(dirname settings.gradle.kts)"
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "FreeScanner"
+          include(":app")
+          EOF
+          mkdir -p "$(dirname build.gradle.kts)"
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          mkdir -p "$(dirname gradle.properties)"
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+          mkdir -p "$(dirname app/build.gradle.kts)"
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.freescanner"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.freescanner"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("com.google.android.gms:play-services-mlkit-document-scanner:16.0.0-beta1")
+              implementation("com.google.mlkit:text-recognition-devanagari:16.0.0")
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+          }
+          EOF
+          mkdir -p "$(dirname app/src/main/AndroidManifest.xml)"
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Free PDF Scanner"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p "$(dirname app/src/main/java/com/example/freescanner/MainActivity.kt)"
+          cat > app/src/main/java/com/example/freescanner/MainActivity.kt <<'EOF'
+          package com.example.freescanner
+
+          import android.app.Activity
+          import android.content.*
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import android.graphics.pdf.PdfRenderer
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.IntentSenderRequest
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+          import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+          import com.google.mlkit.vision.text.TextRecognition
+          import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.pdmodel.encryption.AccessPermission
+          import com.tom_roush.pdfbox.pdmodel.encryption.StandardProtectionPolicy
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  PDFBoxResourceLoader.init(applicationContext)
+                  setContent { MaterialTheme { ScannerScreen(this) } }
+              }
+          }
+
+          data class Doc(val uri: Uri, val name: String)
+
+          private val DL = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+
+          private fun createPdf(ctx: Context, name: String): Uri? {
+              val values = ContentValues().apply {
+                  put(MediaStore.Downloads.DISPLAY_NAME, name)
+                  put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                  put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+              }
+              return ctx.contentResolver.insert(DL, values)
+          }
+
+          private fun saveScan(ctx: Context, src: Uri) {
+              val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+              val out = createPdf(ctx, "Scan_$stamp.pdf") ?: return
+              ctx.contentResolver.openInputStream(src)?.use { i ->
+                  ctx.contentResolver.openOutputStream(out)?.use { i.copyTo(it) }
+              }
+          }
+
+          private fun loadDocs(ctx: Context): List<Doc> {
+              val list = mutableListOf<Doc>()
+              ctx.contentResolver.query(
+                  DL, arrayOf(MediaStore.Downloads._ID, MediaStore.Downloads.DISPLAY_NAME),
+                  "${MediaStore.Downloads.MIME_TYPE}=?", arrayOf("application/pdf"),
+                  "${MediaStore.Downloads.DATE_ADDED} DESC"
+              )?.use { c ->
+                  while (c.moveToNext()) list += Doc(ContentUris.withAppendedId(DL, c.getLong(0)), c.getString(1))
+              }
+              return list
+          }
+
+          private fun renameDoc(ctx: Context, d: Doc, newName: String) {
+              val n = if (newName.endsWith(".pdf", true)) newName else "$newName.pdf"
+              val v = ContentValues().apply { put(MediaStore.Downloads.DISPLAY_NAME, n) }
+              ctx.contentResolver.update(d.uri, v, null, null)
+          }
+
+          private fun deleteDoc(ctx: Context, d: Doc) {
+              ctx.contentResolver.delete(d.uri, null, null)
+          }
+
+          /** Reads text from every page (Hindi + English). Run off the main thread. */
+          private fun runOcr(ctx: Context, d: Doc): String {
+              val pfd = ctx.contentResolver.openFileDescriptor(d.uri, "r") ?: return ""
+              val recognizer = TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
+              val sb = StringBuilder()
+              pfd.use {
+                  PdfRenderer(it).use { r ->
+                      for (i in 0 until r.pageCount) {
+                          r.openPage(i).use { p ->
+                              val bmp = Bitmap.createBitmap(p.width * 2, p.height * 2, Bitmap.Config.ARGB_8888)
+                              bmp.eraseColor(Color.WHITE)
+                              p.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                              val t = Tasks.await(recognizer.process(InputImage.fromBitmap(bmp, 0)))
+                              sb.append(t.text).append("\n\n")
+                          }
+                      }
+                  }
+              }
+              return sb.toString().trim()
+          }
+
+          /** Saves a password-protected copy; the original is kept. */
+          private fun lockPdf(ctx: Context, d: Doc, password: String) {
+              val out = createPdf(ctx, d.name.removeSuffix(".pdf") + " (locked).pdf") ?: error("create failed")
+              ctx.contentResolver.openInputStream(d.uri)!!.use { input ->
+                  PDDocument.load(input).use { doc ->
+                      val policy = StandardProtectionPolicy(password, password, AccessPermission())
+                      policy.encryptionKeyLength = 128
+                      doc.protect(policy)
+                      ctx.contentResolver.openOutputStream(out)!!.use { doc.save(it) }
+                  }
+              }
+          }
+
+          private fun shareDoc(ctx: Context, d: Doc) {
+              val send = Intent(Intent.ACTION_SEND).apply {
+                  type = "application/pdf"
+                  putExtra(Intent.EXTRA_STREAM, d.uri)
+                  addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+              }
+              ctx.startActivity(Intent.createChooser(send, "Share PDF"))
+          }
+
+          @Composable
+          fun ScannerScreen(activity: Activity) {
+              var docs by remember { mutableStateOf(loadDocs(activity)) }
+              var dialog by remember { mutableStateOf<Pair<String, Doc>?>(null) }
+              var input by remember { mutableStateOf("") }
+              var ocrText by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              fun refresh() { docs = loadDocs(activity) }
+              fun toast(m: String) = Toast.makeText(activity, m, Toast.LENGTH_LONG).show()
+              fun work(task: () -> Unit, done: () -> Unit = {}) {
+                  busy = true
+                  Thread {
+                      try { task(); activity.runOnUiThread { done() } }
+                      catch (e: Exception) { activity.runOnUiThread { toast("Failed: ${e.message}") } }
+                      finally { activity.runOnUiThread { busy = false; refresh() } }
+                  }.start()
+              }
+
+              val scanner = GmsDocumentScanning.getClient(
+                  GmsDocumentScannerOptions.Builder()
+                      .setGalleryImportAllowed(true)
+                      .setPageLimit(50)
+                      .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_PDF)
+                      .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                      .build()
+              )
+              val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { r ->
+                  if (r.resultCode == Activity.RESULT_OK) {
+                      GmsDocumentScanningResult.fromActivityResultIntent(r.data)?.pdf?.let {
+                          saveScan(activity, it.uri); refresh()
+                      }
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                  Text("Free PDF Scanner", style = MaterialTheme.typography.headlineMedium)
+                  Button(onClick = {
+                      scanner.getStartScanIntent(activity).addOnSuccessListener {
+                          launcher.launch(IntentSenderRequest.Builder(it).build())
+                      }
+                  }, modifier = Modifier.fillMaxWidth()) { Text("Scan document") }
+                  if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                  if (docs.isEmpty()) Text("No scans yet.")
+                  LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      items(docs, key = { it.uri.toString() }) { d ->
+                          var menu by remember { mutableStateOf(false) }
+                          Card(Modifier.fillMaxWidth()) {
+                              Row(Modifier.padding(start = 16.dp, end = 4.dp), horizontalArrangement = Arrangement.SpaceBetween,
+                                  verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                  Text(d.name, Modifier.weight(1f), maxLines = 1)
+                                  TextButton(onClick = { shareDoc(activity, d) }) { Text("Share") }
+                                  Box {
+                                      TextButton(onClick = { menu = true }) { Text("More") }
+                                      DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                          DropdownMenuItem(text = { Text("Extract text (OCR)") }, onClick = {
+                                              menu = false
+                                              var result = ""
+                                              work({ result = runOcr(activity, d) },
+                                                  { ocrText = result.ifBlank { "No text found." } })
+                                          })
+                                          DropdownMenuItem(text = { Text("Rename") }, onClick = {
+                                              menu = false; input = d.name.removeSuffix(".pdf"); dialog = "rename" to d
+                                          })
+                                          DropdownMenuItem(text = { Text("Add password") }, onClick = {
+                                              menu = false; input = ""; dialog = "lock" to d
+                                          })
+                                          DropdownMenuItem(text = { Text("Delete") }, onClick = {
+                                              menu = false; dialog = "delete" to d
+                                          })
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              dialog?.let { (kind, d) ->
+                  val close = { dialog = null }
+                  when (kind) {
+                      "rename" -> AlertDialog(onDismissRequest = { close() },
+                          title = { Text("Rename") },
+                          text = { OutlinedTextField(input, { input = it }, singleLine = true) },
+                          confirmButton = { TextButton(onClick = {
+                              if (input.isNotBlank()) { renameDoc(activity, d, input.trim()); refresh() }
+                              close()
+                          }) { Text("Save") } },
+                          dismissButton = { TextButton(onClick = { close() }) { Text("Cancel") } })
+                      "lock" -> AlertDialog(onDismissRequest = { close() },
+                          title = { Text("Set password") },
+                          text = { Column {
+                              Text("A locked copy is saved; the original stays.")
+                              OutlinedTextField(input, { input = it }, singleLine = true,
+                                  visualTransformation = PasswordVisualTransformation())
+                          } },
+                          confirmButton = { TextButton(onClick = {
+                              val pw = input; close()
+                              if (pw.length >= 4) work({ lockPdf(activity, d, pw) }, { toast("Locked copy saved") })
+                              else toast("Use at least 4 characters")
+                          }) { Text("Lock") } },
+                          dismissButton = { TextButton(onClick = { close() }) { Text("Cancel") } })
+                      "delete" -> AlertDialog(onDismissRequest = { close() },
+                          title = { Text("Delete ${d.name}?") },
+                          confirmButton = { TextButton(onClick = {
+                              try { deleteDoc(activity, d) } catch (e: Exception) { toast("Can't delete: ${e.message}") }
+                              refresh(); close()
+                          }) { Text("Delete") } },
+                          dismissButton = { TextButton(onClick = { close() }) { Text("Cancel") } })
+                  }
+              }
+
+              ocrText?.let { text ->
+                  AlertDialog(onDismissRequest = { ocrText = null },
+                      title = { Text("Extracted text") },
+                      text = { Column(Modifier.verticalScroll(rememberScrollState())) { SelectionContainer { Text(text) } } },
+                      confirmButton = { TextButton(onClick = {
+                          val cm = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("ocr", text)); toast("Copied")
+                      }) { Text("Copy") } },
+                      dismissButton = { TextButton(onClick = { ocrText = null }) { Text("Close") } })
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk FreePDFScanner.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FreePDFScanner
+          path: FreePDFScanner.apk
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Free PDF Scanner build ${{ github.run_number }}
+          files: FreePDFScanner.apk
